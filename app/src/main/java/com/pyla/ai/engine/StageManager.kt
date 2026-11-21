@@ -44,6 +44,8 @@ class StageManager(
     }
 
     val trophyObserver = TrophyObserver()
+    private val resultCountGate = MatchResultCountGate()
+    private var lastTrophyOcrAttemptMs = 0L
     private val defeatedExitGate = DefeatedExitGate()
     private val resultExitGate = DefeatedExitGate(screen = "end_ranked")
     private val rewardContinueGate = DefeatedExitGate(screen = "reward_continue")
@@ -86,6 +88,7 @@ class StageManager(
         defeatedExitGate.screenChanged(state)
         resultExitGate.screenChanged(state)
         rewardContinueGate.screenChanged(state)
+        resultCountGate.observeState(state)
     }
 
     /**
@@ -146,8 +149,10 @@ class StageManager(
         exitVisibleControl(invocation, "defeated", defeatedExitGate, "defeated_exit", StateFinder::findDefeatedExit)
 
     /** Ranked result screen (Rank / PLAY AGAIN / EXIT): leave through its visible EXIT. */
-    private fun exitResult(invocation: Invocation) =
+    private fun exitResult(invocation: Invocation) {
+        observeRankedResult()
         exitVisibleControl(invocation, "end_ranked", resultExitGate, "result_exit", StateFinder::findResultExit)
+    }
 
     /** Reward presentation: leave through its visible CONTINUE, never through EQUIP/BUY. */
     private fun continueReward(invocation: Invocation) =
@@ -195,10 +200,6 @@ class StageManager(
         PylaUtils.configBool(PylaConfig.load("cfg/bot_config.toml").opt("play_again_on_win"), false)
 
     private var closePopupIcon: Mat? = null
-    private var timeSinceLastStatChange: Double = System.currentTimeMillis() / 1000.0
-
-    private fun nowSec() = System.currentTimeMillis() / 1000.0
-
     fun updateTrophyObserver() {
         val data = brawlersPickData.firstOrNull() ?: return
         trophyObserver.winStreak = toInt(data["win_streak"], 0)
@@ -391,34 +392,104 @@ class StageManager(
         return try { StateFinder.getState(mat, chaosGeneration, captured.capturedAtMs) } finally { mat.release() }
     }
 
+    /**
+     * The video-style ranked result has no legacy victory/defeat word. Its two
+     * mutually exclusive, positively matched Rank headers distinguish a gain
+     * result from a loss result. These are game-UI cues, not server data.
+     */
+    private fun observeRankedResult() {
+        if (closed || !navigationAllowed() || getState() != "end_ranked") return
+        val nowMs = android.os.SystemClock.elapsedRealtime()
+        val needResult = !resultCountGate.hasResult()
+        val needTrophies = !resultCountGate.hasTrophies() &&
+            nowMs - lastTrophyOcrAttemptMs > 2_000L
+        if (!needResult && !needTrophies) return
+        val shot = windowController.screenshot()
+        val frame = PylaUtils.frameToMat(shot)
+        try {
+            if (StateFinder.getState(frame) != "end_ranked") return
+            if (needResult) {
+                val outcome = StateFinder.rankedResultOutcome(frame)
+                if (outcome != null && resultCountGate.claimResult()) {
+                    FarmStatsTracker.recordMatch(outcome, 0)
+                    DiagnosticLog.event("farming.result", "source=rank_header outcome=$outcome")
+                }
+            }
+            if (needTrophies && !closed && navigationAllowed()) {
+                lastTrophyOcrAttemptMs = nowMs
+                val delta = ResultTrophyOcr.readSignedDelta(frame)
+                applyVerifiedTrophyDelta(delta)
+            }
+        } finally {
+            frame.release()
+        }
+    }
+
+    private fun applyVerifiedTrophyDelta(delta: Int?) {
+        if (delta == null || !navigationAllowed() || !resultCountGate.claimTrophies()) return
+        FarmStatsTracker.addConfirmedTrophyDelta(delta)
+        val old = trophyObserver.currentTrophies
+        val adjusted = (old.toLong() + delta.toLong()).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        trophyObserver.changeTrophies(adjusted)
+        brawlersPickData.firstOrNull()?.let { entry ->
+            if (entry["type"].toString() == "trophies") {
+                entry["trophies"] = adjusted
+                try {
+                    BotEngine.saveBrawlerData(brawlersPickData)
+                } catch (t: Throwable) {
+                    DiagnosticLog.failure("stage", "confirmed_trophy_save", "queue_write_threw", t)
+                }
+            }
+        }
+        DiagnosticLog.event("farming.trophies", "source=verified_signed_ocr delta=$delta")
+    }
+
+    private fun readSignedDeltaOnEndScreen(): Int? {
+        val shot = windowController.screenshot()
+        val frame = PylaUtils.frameToMat(shot)
+        return try {
+            val state = StateFinder.getState(frame)
+            if (state.startsWith("end_")) ResultTrophyOcr.readSignedDelta(frame)
+            else null
+        } finally {
+            frame.release()
+        }
+    }
+
     private fun endGame(invocation: Invocation, stateName: String) {
         var currentState = currentStateFromScreen()
         var buttonPressed = false
         var parsedResult: ParsedGameResult? = null
         val endScreenStartMs = android.os.SystemClock.elapsedRealtime()
+        if (stateName in setOf(
+                "end_victory", "end_defeat", "end_draw",
+                "end_trio_showdown_0", "end_trio_showdown_1",
+                "end_trio_showdown_2", "end_trio_showdown_3",
+            ) && resultCountGate.claimResult()) {
+            parsedResult = trophyObserver.parseGameResult(stateName.removePrefix("end_"))
+            trophyObserver.addTrophies(parsedResult, brawlersPickData[0]["brawler"].toString())
+            trophyObserver.addWin(parsedResult)
+            // The model estimate is retained for bot target planning, but is never
+            // exposed as an observed gain. Only a readable signed result is counted.
+            FarmStatsTracker.recordMatch(parsedResult.result, 0)
+            if (!resultCountGate.hasTrophies()) {
+                applyVerifiedTrophyDelta(readSignedDeltaOnEndScreen())
+            }
+            val typeToPush = brawlersPickData[0]["type"].toString()
+            val v = if (typeToPush == "trophies") trophyObserver.currentTrophies else trophyObserver.currentWins
+            brawlersPickData[0][typeToPush] = v
+            brawlersPickData[0]["win_streak"] = trophyObserver.winStreak
+            try {
+                BotEngine.saveBrawlerData(brawlersPickData)
+            } catch (t: Throwable) {
+                DiagnosticLog.failure("stage", "end_save", "queue_write_threw", t)
+                Log.w(TAG, "queue save: ${t.message}")
+            }
+            DiagnosticLog.event("farming.result", "source=verified_end_screen outcome=${parsedResult.result}")
+        }
+
         while (currentState.startsWith("end") &&
             android.os.SystemClock.elapsedRealtime() - endScreenStartMs < END_SCREEN_TIMEOUT_MS) {
-            if (parsedResult == null && nowSec() - timeSinceLastStatChange > 25) {
-                val rawResult = if (currentState.startsWith("end_")) currentState.removePrefix("end_") else currentState
-                parsedResult = trophyObserver.parseGameResult(rawResult)
-                val trophiesBefore = trophyObserver.currentTrophies
-                trophyObserver.addTrophies(parsedResult, brawlersPickData[0]["brawler"].toString())
-                trophyObserver.addWin(parsedResult)
-                FarmStatsTracker.recordMatch(
-                    parsedResult.result, trophyObserver.currentTrophies - trophiesBefore,
-                )
-                timeSinceLastStatChange = nowSec()
-                val typeToPush = brawlersPickData[0]["type"].toString()
-                val v = if (typeToPush == "trophies") trophyObserver.currentTrophies else trophyObserver.currentWins
-                brawlersPickData[0][typeToPush] = v
-                brawlersPickData[0]["win_streak"] = trophyObserver.winStreak
-                try {
-                    BotEngine.saveBrawlerData(brawlersPickData)
-                } catch (t: Throwable) {
-                    DiagnosticLog.failure("stage", "end_save", "queue_write_threw", t)
-                    Log.w(TAG, "queue save: ${t.message}")
-                }
-            }
             if (!buttonPressed && playAgainOnWin && parsedResult != null &&
                 parsedResult.result == MatchResultKind.VICTORY) {
                 windowController.guardedNavigationPress("play_again", 20L, invocation.action(currentState))
@@ -428,8 +499,6 @@ class StageManager(
                 BotStatus.action("End screen ($currentState), pressing proceed")
                 windowController.guardedNavigationPress("proceed", 20L, invocation.action(currentState))
             }
-            // Cancellation-aware wait: a Pause/Stop during the end screen aborts the whole invocation
-            // and must NOT fall through to a recovery relaunch.
             if (!invocation.await(3_000)) return
             currentState = currentStateFromScreen()
         }
@@ -439,9 +508,6 @@ class StageManager(
         if (playAgainOnWin && parsedResult?.result == MatchResultKind.VICTORY) {
             handOffToGameplayVerifier()
         } else if (endScreenTimedOut && currentState.startsWith("end")) {
-            // PC parity: the end screen never went away (frozen game / missed clicks), restart the
-            // game so the bot can never get stuck here. Recovery is allowed only while THIS invocation
-            // is still live (same session/state) with the current verified end-screen context.
             DiagnosticLog.failure("stage", "end_screen", "timeout")
             Log.w(TAG, "End screen timeout reached, restarting the game.")
             relaunchGame(invocation)

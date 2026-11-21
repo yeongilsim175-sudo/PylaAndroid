@@ -57,6 +57,13 @@ object FarmStatsTracker {
             .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
     }
 
+    /** Only signed trophy changes actually read from the result screen enter the HUD. */
+    @Synchronized fun addConfirmedTrophyDelta(delta: Int) {
+        if (!started || !running) return
+        earnedTrophies = (earnedTrophies.toLong() + delta.toLong())
+            .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+    }
+
     @Synchronized fun snapshot(nowMs: Long): FarmStatsSnapshot {
         val activeDelta = activeStartMs?.let { (nowMs - it).coerceAtLeast(0L) } ?: 0L
         return FarmStatsSnapshot(
