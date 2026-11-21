@@ -261,6 +261,7 @@ class BotEngine(
         mainWorkerSettled.set(false)
         stateCheckerSettled.set(false)
         BotStatus.engineRunning = true
+        FarmStatsTracker.start(SystemClock.elapsedRealtime())
         BotStatus.enginePaused = false
         BotStatus.lastError = ""
         BotStatus.resetVerification()
@@ -440,6 +441,7 @@ class BotEngine(
         if (::stateThread.isInitialized) { stateThread.quitSafely(); stateThread.interrupt() }
         // Publish stop status only as the owner, so an obsolete stop cannot reset a new session.
         if (owner) {
+            FarmStatsTracker.stop(SystemClock.elapsedRealtime())
             BotStatus.engineRunning = false
             BotStatus.enginePaused = false
             BotStatus.currentState = ""
@@ -475,6 +477,7 @@ class BotEngine(
         // Reset status BEFORE releasing ownership. Otherwise a new owner can publish its running
         // status between instance=null and these writes, only to have it erased by this worker.
         if (instance === this) {
+            FarmStatsTracker.stop(SystemClock.elapsedRealtime())
             BotStatus.engineRunning = false
             BotStatus.enginePaused = false
             BotStatus.currentState = ""
@@ -526,6 +529,7 @@ class BotEngine(
             if (p && ::play.isInitialized) play.resetCombat()
             if (p && ::windowController.isInitialized) windowController.releaseMovement()
             BotStatus.enginePaused = p && BotStatus.engineRunning
+            FarmStatsTracker.setPaused(BotStatus.enginePaused, SystemClock.elapsedRealtime())
             // Pause and resume are both lifecycle boundaries: nothing measured before either may be
             // presented afterwards. Resume re-announces the already loaded playstyle metadata.
             resetHudTelemetry(announcePlaystyle = !p)

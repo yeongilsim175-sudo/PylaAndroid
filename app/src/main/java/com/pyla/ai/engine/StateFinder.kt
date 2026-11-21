@@ -206,6 +206,26 @@ object StateFinder {
         return null
     }
 
+    /** Classify ranked result by the distinguishable blue/cream or red/orange rank header. */
+    fun rankedResultOutcome(image: Mat): MatchResultKind? {
+        val root = PylaConfig.resolve("images/video_state_cues/")
+        val win = isTemplateInRegion(
+            image, File(root, "rank_win.png").absolutePath,
+            VideoScreenStateCues.regions.getValue("rank_win"),
+            VideoScreenStateCues.THRESHOLD, slackX = REGION_SLACK_X,
+        )
+        val loss = isTemplateInRegion(
+            image, File(root, "rank.png").absolutePath,
+            VideoScreenStateCues.regions.getValue("rank"),
+            VideoScreenStateCues.THRESHOLD, slackX = REGION_SLACK_X,
+        )
+        return when {
+            win && !loss -> MatchResultKind.VICTORY
+            loss && !win -> MatchResultKind.DEFEAT
+            else -> null
+        }
+    }
+
     private fun inShop(image: Mat) = isTemplateInRegion(image, File(statesPath, "powerpoint.png").absolutePath, regions.getIntArray("template_matching.powerpoint"))
     private fun inBrawlerSelection(image: Mat) = isTemplateInRegion(image, File(statesPath, "brawler_menu_heart.png").absolutePath, regions.getIntArray("template_matching.brawler_menu_heart"))
     private fun inOfferPopup(image: Mat) = isTemplateInRegion(image, File(statesPath, "close_popup.png").absolutePath, regions.getIntArray("template_matching.close_popup"))
