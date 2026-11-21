@@ -398,11 +398,15 @@ class StageManager(
         val endScreenStartMs = android.os.SystemClock.elapsedRealtime()
         while (currentState.startsWith("end") &&
             android.os.SystemClock.elapsedRealtime() - endScreenStartMs < END_SCREEN_TIMEOUT_MS) {
-            if (nowSec() - timeSinceLastStatChange > 25) {
+            if (parsedResult == null && nowSec() - timeSinceLastStatChange > 25) {
                 val rawResult = if (currentState.startsWith("end_")) currentState.removePrefix("end_") else currentState
                 parsedResult = trophyObserver.parseGameResult(rawResult)
+                val trophiesBefore = trophyObserver.currentTrophies
                 trophyObserver.addTrophies(parsedResult, brawlersPickData[0]["brawler"].toString())
                 trophyObserver.addWin(parsedResult)
+                FarmStatsTracker.recordMatch(
+                    parsedResult.result, trophyObserver.currentTrophies - trophiesBefore,
+                )
                 timeSinceLastStatChange = nowSec()
                 val typeToPush = brawlersPickData[0]["type"].toString()
                 val v = if (typeToPush == "trophies") trophyObserver.currentTrophies else trophyObserver.currentWins
