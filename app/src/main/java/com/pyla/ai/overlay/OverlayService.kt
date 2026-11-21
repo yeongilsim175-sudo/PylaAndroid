@@ -23,6 +23,7 @@ import android.view.View
 import android.view.WindowManager
 import com.pyla.ai.engine.BotEngine
 import com.pyla.ai.engine.BotStatus
+import com.pyla.ai.engine.FarmStatsTracker
 import com.pyla.ai.engine.HudTelemetry
 import com.pyla.ai.engine.RuntimeVerification
 import kotlin.math.min
@@ -60,7 +61,7 @@ class OverlayService : Service() {
 
     private var bubbleView: BubbleView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
-    private var hudView: HudView? = null
+    private var hudView: FarmStatsOverlayView? = null
     private var hudParams: WindowManager.LayoutParams? = null
     private val controlViews = ArrayList<ControlView>()
     private val controlParams = ArrayList<WindowManager.LayoutParams>()
@@ -172,7 +173,7 @@ class OverlayService : Service() {
         if (bubbleView == null && hudView == null) return
         try {
             readConfiguration()
-            hudView?.apply { reconfigure(hudSpec) }
+            hudView?.reconfigure()
             bubbleView?.apply { reconfigure() }
             applyHudLayout()
             applyBubbleLayout()
@@ -218,7 +219,7 @@ class OverlayService : Service() {
         val p = baseParams(1, metrics.hudHeightPx, touchable = false)
         p.alpha = hudWindowAlpha()
         hudParams = p
-        val v = HudView(this, hudSpec)
+        val v = FarmStatsOverlayView(this)
         hudView = v
         addWindow(v, p)
         refreshStatus()
@@ -236,24 +237,21 @@ class OverlayService : Service() {
         addWindow(v, p)
     }
 
-    /**
-     * Re-measures the pill for the current text and re-centres its window. The window is resized
-     * only when its size actually changes, so a stable HUD causes no layout churn.
-     */
+    /** Transparent five-line HUD anchored to the top-right safe viewport. */
     private fun applyHudLayout() {
         val v = hudView ?: return
         val p = hudParams ?: return
         val safeWidth = (geometry.widthPx - geometry.insetLeftPx - geometry.insetRightPx -
             2 * metrics.edgeMarginPx).coerceAtLeast(1)
-        val frame = v.update(hudCompact, hudDetail, hudError, hudStatus, hudRaw, safeWidth.toFloat())
-        val rect = OverlayGeometry.pillRect(
-            geometry, metrics,
-            frame.width.roundToInt().coerceAtLeast(1),
-            frame.height.roundToInt().coerceAtLeast(1),
+        val (widthPx, heightPx) = v.updateStats(
+            FarmStatsTracker.snapshot(SystemClock.elapsedRealtime()), safeWidth,
         )
-        val changed = p.width != rect.width || p.height != rect.height || p.x != rect.left || p.y != rect.top
-        p.width = rect.width; p.height = rect.height
-        p.x = rect.left; p.y = rect.top
+        val newX = (geometry.widthPx - geometry.insetRightPx - metrics.edgeMarginPx - widthPx)
+            .coerceAtLeast(geometry.insetLeftPx)
+        val newY = geometry.insetTopPx + metrics.edgeMarginPx
+        val changed = p.width != widthPx || p.height != heightPx || p.x != newX || p.y != newY
+        p.width = widthPx; p.height = heightPx
+        p.x = newX; p.y = newY
         if (changed) updateWindow(v, p)
     }
 
@@ -365,8 +363,7 @@ class OverlayService : Service() {
         }
         hudError = if (detailOpen && running) error else null
 
-        hudView?.apply { setAccessibilityText(hudStatus, hudCompact) }
-        bubbleView?.apply { setEngine(running, paused) }
+                bubbleView?.apply { setEngine(running, paused) }
         controlViews.forEach { it.setEngine(running, paused) }
         applyHudLayout()
     }
