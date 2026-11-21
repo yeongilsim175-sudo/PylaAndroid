@@ -363,7 +363,7 @@ class OverlayService : Service() {
         }
         hudError = if (detailOpen && running) error else null
 
-                bubbleView?.apply { setEngine(running, paused) }
+        bubbleView?.apply { setEngine(running, paused) }
         controlViews.forEach { it.setEngine(running, paused) }
         applyHudLayout()
     }
