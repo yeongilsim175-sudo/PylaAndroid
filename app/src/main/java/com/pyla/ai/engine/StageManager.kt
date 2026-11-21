@@ -46,6 +46,7 @@ class StageManager(
     val trophyObserver = TrophyObserver()
     private val resultCountGate = MatchResultCountGate()
     private var lastTrophyOcrAttemptMs = 0L
+    @Volatile private var beforeResultTrophies: Int? = null
     private val defeatedExitGate = DefeatedExitGate()
     private val resultExitGate = DefeatedExitGate(screen = "end_ranked")
     private val rewardContinueGate = DefeatedExitGate(screen = "reward_continue")
@@ -89,6 +90,9 @@ class StageManager(
         resultExitGate.screenChanged(state)
         rewardContinueGate.screenChanged(state)
         resultCountGate.observeState(state)
+        if (state == "match" || state == "match_making" || state == "match_start") {
+            beforeResultTrophies = null
+        }
     }
 
     /**
@@ -411,6 +415,7 @@ class StageManager(
             if (needResult) {
                 val outcome = StateFinder.rankedResultOutcome(frame)
                 if (outcome != null && resultCountGate.claimResult()) {
+                    beforeResultTrophies = trophyObserver.currentTrophies
                     FarmStatsTracker.recordMatch(outcome, 0)
                     DiagnosticLog.event("farming.result", "source=rank_header outcome=$outcome")
                 }
@@ -428,8 +433,8 @@ class StageManager(
     private fun applyVerifiedTrophyDelta(delta: Int?) {
         if (delta == null || !navigationAllowed() || !resultCountGate.claimTrophies()) return
         FarmStatsTracker.addConfirmedTrophyDelta(delta)
-        val old = trophyObserver.currentTrophies
-        val adjusted = (old.toLong() + delta.toLong()).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        val baseTrophies = beforeResultTrophies ?: trophyObserver.currentTrophies
+        val adjusted = (baseTrophies.toLong() + delta.toLong()).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
         trophyObserver.changeTrophies(adjusted)
         brawlersPickData.firstOrNull()?.let { entry ->
             if (entry["type"].toString() == "trophies") {
@@ -467,6 +472,7 @@ class StageManager(
                 "end_trio_showdown_2", "end_trio_showdown_3",
             ) && resultCountGate.claimResult()) {
             parsedResult = trophyObserver.parseGameResult(stateName.removePrefix("end_"))
+            beforeResultTrophies = trophyObserver.currentTrophies
             trophyObserver.addTrophies(parsedResult, brawlersPickData[0]["brawler"].toString())
             trophyObserver.addWin(parsedResult)
             // The model estimate is retained for bot target planning, but is never
