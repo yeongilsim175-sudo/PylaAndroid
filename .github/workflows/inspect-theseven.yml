@@ -106,6 +106,18 @@ jobs:
             fi
           fi
 
+      - name: Verify signing certificate and checksum
+        shell: bash
+        run: |
+          if [ "$download_success" != "true" ]; then exit 0; fi
+          sha256sum "$RUNNER_TEMP/TheSeven.apk" >analysis-report/sha256.txt
+          if [ -n "$ANDROID_HOME" ]; then
+            SIGNER=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name apksigner -print -quit 2>/dev/null || true)
+            if [ -n "$SIGNER" ]; then
+              timeout 180 "$SIGNER" verify --print-certs --verbose "$RUNNER_TEMP/TheSeven.apk" >analysis-report/signature.txt 2>&1 || true
+            fi
+          fi
+
       - name: Upload analysis reports only (never the APK)
         if: always()
         uses: actions/upload-artifact@v4
