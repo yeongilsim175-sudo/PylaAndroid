@@ -1,0 +1,116 @@
+name: Static inspection of TheSeven APK
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-theseven.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Download and inspect public APK without executing it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download public Google Drive APK (not uploaded to GitHub)
+        shell: bash
+        run: |
+          mkdir -p analysis-report
+          python -m pip install --quiet gdown==5.2.0
+          if timeout 1500 gdown --id 1v1FS-iYai-V3bb3RdYzfEj6T6f1XqLEf --output "$RUNNER_TEMP/TheSeven.apk" --no-cookies >analysis-report/download.log 2>&1; then
+            echo "download_success=true" >> "$GITHUB_ENV"
+            echo "APK downloaded successfully" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "download_success=false" >> "$GITHUB_ENV"
+            echo "Drive transfer failed; see sanitized download status" >> "$GITHUB_STEP_SUMMARY"
+            tail -n 20 analysis-report/download.log | sed -E 's/(id=)[A-Za-z0-9_-]+/\1[redacted]/g' >analysis-report/download-status.txt
+          fi
+
+      - name: Offline ZIP and DEX inspection
+        shell: bash
+        run: |
+          if [ "$download_success" != "true" ]; then
+            echo "No APK to inspect (transfer unavailable)" >analysis-report/report.txt
+            exit 0
+          fi
+          python - <<'PY' > analysis-report/report.txt
+          import collections, os, zipfile, re
+          path=os.environ['RUNNER_TEMP']+'/TheSeven.apk'
+          print('FILE_SIZE_BYTES:', os.stat(path).st_size)
+          print('IS_ZIP:', zipfile.is_zipfile(path))
+          with zipfile.ZipFile(path) as z:
+              members=z.infolist()
+              print('ENTRIES:', len(members))
+              print('COMPRESSION_COUNTS:',dict(collections.Counter(m.compress_type for m in members)))
+              print('TOP_DIRECTORIES:',collections.Counter(m.filename.split('/')[0] for m in members).most_common(35))
+              print('TOP_EXTENSIONS:',collections.Counter(os.path.splitext(m.filename)[1].lower() for m in members if not m.is_dir()).most_common(40))
+              print('TOTAL_UNCOMPRESSED_BYTES:',sum(m.file_size for m in members))
+              print('TOTAL_COMPRESSED_BYTES:',sum(m.compress_size for m in members))
+              print('LARGEST_30_FILES:')
+              for m in sorted(members,key=lambda m:m.file_size,reverse=True)[:30]:
+                  print(' ',m.file_size,m.filename[:180])
+              print('DEX_FILES:',[(m.filename,m.file_size) for m in members if re.fullmatch(r'classes\d*\.dex',m.filename)])
+              print('NATIVE_LIBRARIES:')
+              for m in members:
+                  if m.filename.startswith('lib/') and m.filename.endswith('.so'):
+                      print(' ',m.file_size,m.filename[:180])
+              print('KEY_APK_FILES:',[(x.filename,x.file_size) for x in members if x.filename in ('AndroidManifest.xml','resources.arsc','assets/bin/Data/global-metadata.dat')])
+              names=['overlay','troph','victory','defeat','win','loss','brawler','results','result','pyla','automation','ocr','unity','il2cpp','gameassembly']
+              print('RELEVANT_ENTRY_NAMES:')
+              for m in members:
+                  if not m.is_dir() and any(k in m.filename.lower() for k in names):
+                      print(' ',m.filename[:180],m.file_size)
+              print('SYMBOL_KEYWORD_COUNTS_IN_SELECTED_DEX:')
+              for m in members:
+                  if re.fullmatch(r'classes\d*\.dex',m.filename) and m.file_size <= 130_000_000:
+                      data=z.read(m)
+                      counts={k:len(re.findall(re.escape(k.encode()),data,re.I)) for k in ['trophy','victory','defeat','matchresult','overlay','Pyla','brawler','recognize','mlkit','unity']}
+                      print(' ',m.filename,counts)
+              print('SYMBOL_KEYWORD_COUNTS_IN_SELECTED_NATIVE_SO:')
+              for m in members:
+                  if m.filename.startswith('lib/') and m.filename.endswith('.so') and m.file_size < 160_000_000 and ('il2cpp' in m.filename or 'unity' in m.filename):
+                      counts={k:0 for k in ['trophy','victory','defeat','matchresult','overlay','brawler']}
+                      with z.open(m) as f:
+                          preceding=b''
+                          for block in iter(lambda:f.read(1024*1024),b''):
+                              data=(preceding+block).lower()
+                              for k in counts: counts[k]+=data.count(k.encode())
+                              preceding=data[-32:]
+                      print(' ',m.filename,counts)
+          PY
+
+      - name: Inspect Android manifest with SDK tools
+        shell: bash
+        run: |
+          if [ "$download_success" != "true" ]; then exit 0; fi
+          if [ -n "$ANDROID_HOME" ]; then
+            AAPT=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name aapt -print -quit 2>/dev/null || true)
+            if [ -n "$AAPT" ]; then
+              timeout 180 "$AAPT" dump badging "$RUNNER_TEMP/TheSeven.apk" >analysis-report/badging.txt 2>analysis-report/badging-error.txt || true
+              timeout 180 "$AAPT" dump permissions "$RUNNER_TEMP/TheSeven.apk" >analysis-report/permissions.txt 2>/dev/null || true
+              timeout 180 "$AAPT" dump xmltree "$RUNNER_TEMP/TheSeven.apk" AndroidManifest.xml >analysis-report/manifest-xmltree.txt 2>/dev/null || true
+            else
+              echo "aapt not installed on runner" >analysis-report/badging-error.txt
+            fi
+          fi
+
+      - name: Upload analysis reports only (never the APK)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: theseven-static-inspection
+          path: analysis-report/
+          retention-days: 7
+          if-no-files-found: error
